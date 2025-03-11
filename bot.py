@@ -4,7 +4,8 @@ import logging
 
 from discord.ext import commands
 from dotenv import load_dotenv
-from agent import MistralAgent
+from chatgpt_bot import get_chatgpt_response
+from chatgpt_stream import chatgpt_stream_response
 
 PREFIX = "!"
 
@@ -14,18 +15,14 @@ logger = logging.getLogger("discord")
 # Load the environment variables
 load_dotenv()
 
+# Get the token and print it for debugging
+token = os.getenv("DISCORD_TOKEN")
+print("Loaded Discord token:", token)  # Debug print
+
 # Create the bot with all intents
 # The message content and members intent must be enabled in the Discord Developer Portal for the bot to work.
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
-
-# Import the Mistral agent from the agent.py file
-agent = MistralAgent()
-
-
-# Get the token from the environment variables
-token = os.getenv("DISCORD_TOKEN")
-
 
 @bot.event
 async def on_ready():
@@ -52,12 +49,9 @@ async def on_message(message: discord.Message):
     if message.author.bot or message.content.startswith("!"):
         return
 
-    # Process the message with the agent you wrote
-    # Open up the agent.py file to customize the agent
+    # Process the message with ChatGPT
     logger.info(f"Processing message from {message.author}: {message.content}")
-    response = await agent.run(message)
-
-    # Send the response back to the channel
+    response = get_chatgpt_response(message.content)
     await message.reply(response)
 
 
@@ -74,6 +68,48 @@ async def ping(ctx, *, arg=None):
     else:
         await ctx.send(f"Pong! Your argument was {arg}")
 
+
+@bot.command(name='ask')
+async def ask(ctx, *, question):
+    """Get a response from ChatGPT"""
+    response = get_chatgpt_response(question)
+    await ctx.send(response)
+
+@bot.command(name='askstream')
+async def askstream(ctx, *, question):
+    """Get a streaming response from ChatGPT"""
+    message = await ctx.send("Thinking...")
+    try:
+        # Get the streaming response and update message periodically
+        current_response = ""
+        async for chunk in chatgpt_stream_response(question):
+            current_response += chunk
+            if len(current_response) % 100 == 0:  # Update every ~100 characters
+                await message.edit(content=current_response)
+        
+        # Final update with complete response
+        await message.edit(content=current_response)
+    except Exception as e:
+        await message.edit(content=f"Error: {str(e)}")
+
+@bot.command(name='join')
+async def join(ctx):
+    """Join the user's voice channel"""
+    if ctx.author.voice:
+        channel = ctx.author.voice.channel
+        await channel.connect()
+        await ctx.send(f'Joined {channel.name}')
+    else:
+        await ctx.send('You need to be in a voice channel first!')
+
+@bot.command(name='leave')
+async def leave(ctx):
+    """Leave the voice channel"""
+    if ctx.voice_client:
+        await ctx.voice_client.disconnect()
+        await ctx.send('Left the voice channel')
+    else:
+        await ctx.send('I am not in a voice channel')
 
 # Start the bot, connecting it to the gateway
 bot.run(token)
