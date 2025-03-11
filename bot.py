@@ -6,11 +6,17 @@ from discord.ext import commands
 from dotenv import load_dotenv
 from chatgpt_bot import get_chatgpt_response
 from chatgpt_stream import chatgpt_stream_response
+from text_to_voice import generate_and_stream_to_discord
 
 PREFIX = "!"
 
 # Setup logging
 logger = logging.getLogger("discord")
+
+# TODO: change this if deploying on cloud
+if not discord.opus.is_loaded():
+    print("Opus is not loaded! Trying to load it manually...")
+    discord.opus.load_opus("/opt/homebrew/Cellar/opus/1.5.2/lib/libopus.dylib")
 
 # Load the environment variables
 load_dotenv()
@@ -51,8 +57,14 @@ async def on_message(message: discord.Message):
 
     # Process the message with ChatGPT
     logger.info(f"Processing message from {message.author}: {message.content}")
-    response = get_chatgpt_response(message.content)
-    await message.reply(response)
+    
+    # check if the bot is in a voice channel, speak response if it is
+    if message.guild and message.guild.voice_client:
+        response = get_chatgpt_response(message.content)
+        await generate_and_stream_to_discord(response, message.guild.voice_client)
+    else:
+        response = get_chatgpt_response(message.content)
+        await message.reply(response)
 
 
 # Commands
@@ -101,6 +113,7 @@ async def join(ctx):
         await ctx.send(f'Joined {channel.name}')
     else:
         await ctx.send('You need to be in a voice channel first!')
+
 
 @bot.command(name='leave')
 async def leave(ctx):
