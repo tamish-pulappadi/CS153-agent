@@ -67,8 +67,8 @@ async def on_message(message: discord.Message):
     
     # check if the bot is in a voice channel, speak response if it is
     if message.guild and message.guild.voice_client:
-        response = get_chatgpt_response(message.content)
-        await generate_and_stream_to_discord(response, message.guild.voice_client)
+        #response = get_chatgpt_response(message.content)
+        await generate_and_stream_to_discord(message.content, message.guild.voice_client)
     else:
         response = get_chatgpt_response(message.content)
         await message.reply(response)

@@ -4,18 +4,29 @@ import {
     joinVoiceChannel,
     EndBehaviorType,
     VoiceReceiver,
-    getVoiceConnection
+    createAudioResource,
+    getVoiceConnection,
+    createAudioPlayer
 } from '@discordjs/voice';
-import prism from 'prism-media';
-import WebSocket from 'ws';
+import prism, { opus } from 'prism-media';
 import fetch from 'node-fetch';
+import { Readable } from 'stream';
+
+import { AssemblyAI } from "assemblyai";
+import { ElevenLabsClient } from "elevenlabs";
 
 // Initialize dotenv
 dotenv.config();
 
 // Environment variables
+const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY;
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const GLADIA_API_KEY = process.env.GLADIA_API_KEY;
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+
+const assemblyAI = new AssemblyAI({ apiKey: ASSEMBLYAI_API_KEY });
+const elevenLabs = new ElevenLabsClient({ apiKey: ELEVENLABS_API_KEY });
+
+const player = createAudioPlayer();
 
 // Create Discord client
 const client = new Client({
@@ -40,10 +51,12 @@ client.on('messageCreate', async (message) => {
 
     const command = message.content.toLowerCase();
 
-    if (command === '!joinvc') {
+    if (command === '!join') {
         await handleJoinVC(message);
-    } else if (command === '!leavevc') {
+    } else if (command === '!leave') {
         await handleLeaveVC(message);
+    } else if (command === '!help') {
+        message.reply('🎤 **Eva, your personal assistanct -- Bot Commands**\n`!join` - Start assistance in your voice channel\n`!leave` - Stop assistance and leave channel and save transcript\n`!help` - Show this help message');
     }
 });
 
@@ -67,7 +80,7 @@ async function handleJoinVC(message) {
             guildId: guildId,
             adapterCreator: message.guild.voiceAdapterCreator,
             selfDeaf: false,
-            selfMute: true
+            selfMute: false
         });
 
         // Get the voice receiver
@@ -80,10 +93,22 @@ async function handleJoinVC(message) {
             channel: channel
         });
 
-        // Set up speaking event
-        connection.receiver.speaking.on('start', (userId) => {
+        // Set up speaking event to handle only one user at a time
+        let currentlySpeakingUsers = new Set();
+        receiver.speaking.on('start', (userId) => {
+            if (currentlySpeakingUsers.has(userId)) {
+                console.log(`🚫 User ${userId} tried to speak again, but they are already speaking.`);
+                return;
+            }
             console.log(`🎙️ User ${userId} started speaking`);
-            handleUserAudio(connection.receiver, userId, guildId);
+            currentlySpeakingUsers.add(userId);
+            handleUserAudio(connection, userId, guildId);
+        });
+        receiver.speaking.on('end', (userId) => {
+            if (currentlySpeakingUsers.has(userId)) {
+                console.log(`🚫 User ${userId} stopped speaking.`);
+                currentlySpeakingUsers.delete(userId);
+            }
         });
 
         console.log(`🎤 Joined VC: ${channel.name}`);
@@ -95,7 +120,35 @@ async function handleJoinVC(message) {
     }
 }
 
-async function handleUserAudio(receiver, userId, guildId) {
+async function handleUserAudio(connection, userId, guildId) {
+    const receiver = connection.receiver;
+
+    // Set up the real-time transcriber
+    const transcriber = assemblyAI.realtime.transcriber({
+        sampleRate: 48000, // Match the sample rate used in Discord audio
+       });
+    
+    await transcriber.connect();
+
+    transcriber.on('open', ({ sessionId }) => {
+        console.log(`Real-time session opened with ID: ${sessionId}`);
+      });
+    
+    transcriber.on('error', (error) => {
+    console.error('Real-time transcription error:', error);
+    });
+
+    transcriber.on('close', (code, reason) => {
+    console.log('Real-time session closed:', code, reason);
+    });
+
+    var transcription =""
+    transcriber.on('transcript', (transcript) => {
+    if (transcript.message_type === 'FinalTranscript') {
+        transcription += transcript.text + " "; // Append to the full message
+    }
+    });
+
     // Create audio stream
     const audioStream = receiver.subscribe(userId, {
         end: {
@@ -103,57 +156,42 @@ async function handleUserAudio(receiver, userId, guildId) {
             duration: 1000
         }
     });
-
-    // Create Opus decoder
-    const decoder = new prism.opus.Decoder({
-        rate: 16000,
-        channels: 1,
-        frameSize: 960
+    
+    const opusDecoder = new prism.opus.Decoder({ rate: 48000, channels: 1 });
+    
+    // Pipe the decoded audio chunks to AssemblyAI for transcription
+    audioStream.pipe(opusDecoder).on("data", (chunk) => {
+        transcriber.sendAudio(chunk);
     });
 
-    // Pipe audio through decoder
-    audioStream.pipe(decoder);
-
-    // Connect to Gladia WebSocket
-    const ws = new WebSocket('wss://api.gladia.io/audio/text/audio-transcription', {
-        headers: {
-            'x-gladia-key': GLADIA_API_KEY
-        }
-    });
-
-    ws.on('open', () => {
-        console.log(`🔌 WebSocket connected for user ${userId}`);
-        
-        decoder.on('data', (chunk) => {
-            if (ws.readyState === WebSocket.OPEN) {
-                ws.send(chunk);
-            }
-        });
-    });
-
-    ws.on('message', async (data) => {
+    // Handle disconnection
+    audioStream.on("end", async () => {
+        await transcriber.close();
+        // Send to python flask
         try {
-            const response = JSON.parse(data);
-            if (response.prediction && response.prediction.trim()) {
-                console.log(`📝 Transcription for ${userId}: ${response.prediction}`);
-                await sendTranscriptionToPython(userId, response.prediction);
+            if (transcription) {
+                console.log(`📝 Generating response for for ${userId}: ${transcription}`);
+                const response = await sendTranscriptionToPython(userId, transcription);
+                console.log(`Response received from Python: ${response}`);
+
+                const audioStream = await elevenLabs.textToSpeech.convertAsStream("19STyYD15bswVz51nqLf", {
+                    text: response.response,
+                    model_id: "eleven_turbo_v2_5"
+                });
+
+                const resource = createAudioResource(Readable.from(audioStream));
+                player.play(resource);
+
+                //const audioSource = new discord.AudioResource(Readable.from(readableStream), { inlineVolume: true });
+                //const player = voiceClient.play(audioSource);
+
+                connection.subscribe(player);
+                player.on('error', console.error);
+                    
             }
         } catch (error) {
             console.error('Error processing transcription:', error);
         }
-    });
-
-    ws.on('error', (error) => {
-        console.error(`WebSocket error for ${userId}:`, error);
-    });
-
-    ws.on('close', () => {
-        console.log(`WebSocket closed for ${userId}`);
-    });
-
-    audioStream.on('end', () => {
-        ws.close();
-        decoder.destroy();
     });
 }
 
@@ -192,9 +230,12 @@ async function sendTranscriptionToPython(userId, transcript) {
             throw new Error(`HTTP error! status: ${response.status}`);
         }
 
-        console.log(`✅ Sent transcript to Python bot for user ${userId}`);
+        const data = await response.json();
+        console.log(`✅ Sent transcript to Python bot for user ${userId}. Response: ${JSON.stringify(data)}`);
+        return data; // Return the response data
     } catch (error) {
         console.error('Error sending transcript to Python:', error);
+        throw error; // Rethrow the error to handle it in the calling function
     }
 }
 

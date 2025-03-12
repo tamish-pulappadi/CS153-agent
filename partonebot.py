@@ -3,12 +3,18 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 import asyncio
-from flask import Flask, request
+from flask import Flask, request, jsonify
 import threading
 from datetime import datetime
 import json
 from deepgram import Deepgram
 import wave
+import logging
+from chatgpt_bot import get_chatgpt_response
+from chatgpt_stream import chatgpt_stream_response
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -50,13 +56,18 @@ def receive_transcription():
     user_id = data.get('user')
     message = data.get('message')
     
-    # Find active session for this user
-    for session_id, session in active_sessions.items():
-        if session.is_active:
-            session.add_transcript(user_id, message)
-            print(f"📝 Received from {user_id}: {message}")
+    print(f"📝 Received from {user_id}: {message}")
+
+    # generate response
+    logger.info(f"📝 Received from {user_id}: {message}")
     
-    return '', 200
+    # check if the bot is in a voice channel, speak response if it is
+    if message:
+        response = get_chatgpt_response(message)
+        #response = "hi how are you"
+        return jsonify({'response': response}), 200
+    
+    return jsonify({'response': ''}), 200
 
 @bot.event
 async def on_ready():
@@ -110,7 +121,6 @@ async def leavevc(ctx):
     
     if session_id in active_sessions:
         active_sessions[session_id].is_active = False
-        await save_transcript(ctx, session_id)
         del active_sessions[session_id]
         await ctx.send("👋 Stopped tracking transcriptions. Transcript has been saved!")
     else:
@@ -153,7 +163,7 @@ async def savenow(ctx):
     except Exception as e:
         await ctx.send(f"❌ Error saving transcript: {str(e)}")
 
-@bot.command(name='help')
+@bot.command(name='helpme')
 async def help(ctx):
     help_text = """
 🎤 **Voice Transcription Bot Commands**
@@ -216,4 +226,4 @@ if __name__ == "__main__":
     flask_thread.start()
     
     # Run Discord bot in main thread
-    run_discord_bot()
+    #run_discord_bot()
