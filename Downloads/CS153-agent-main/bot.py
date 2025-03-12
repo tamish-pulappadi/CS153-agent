@@ -3,10 +3,12 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 import asyncio
+from flask import Flask, request
+import threading
+from datetime import datetime
 import json
 from deepgram import Deepgram
 import wave
-import datetime
 
 # Load environment variables
 load_dotenv()
@@ -14,166 +16,204 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 DEEPGRAM_API_KEY = os.getenv('DEEPGRAM_API_KEY')
 
+# Set up Discord bot
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Dictionary to store transcripts for each session
-transcripts = {}
+# Set up Flask app
+app = Flask(__name__)
+
+# Dictionary to store active transcription sessions
+active_sessions = {}
+
+class TranscriptionSession:
+    def __init__(self, channel_name):
+        self.channel_name = channel_name
+        self.transcripts = []
+        self.start_time = datetime.now()
+        self.is_active = True
+
+    def add_transcript(self, user_id, text):
+        self.transcripts.append({
+            'user_id': user_id,
+            'text': text,
+            'timestamp': datetime.now().strftime('%H:%M:%S')
+        })
+
+# Flask route to receive transcriptions from Node.js
+@app.route('/transcription', methods=['POST'])
+def receive_transcription():
+    data = request.json
+    user_id = data.get('user')
+    message = data.get('message')
+    
+    # Find active session for this user
+    for session_id, session in active_sessions.items():
+        if session.is_active:
+            session.add_transcript(user_id, message)
+            print(f"📝 Received from {user_id}: {message}")
+    
+    return '', 200
 
 @bot.event
 async def on_ready():
     print(f"🎤 {bot.user} is ready and online!")
 
+@bot.command(name='joinvc')
+async def joinvc(ctx):
+    if not ctx.author.voice:
+        return await ctx.send("❌ You need to be in a voice channel first.")
+    
+    try:
+        channel = ctx.author.voice.channel
+        session_id = f"{ctx.guild.id}_{channel.id}"
+        
+        # Create new transcription session
+        active_sessions[session_id] = TranscriptionSession(channel.name)
+        
+        await ctx.send(f"✅ Tracking transcriptions in {channel.name}!")
+        
+    except Exception as e:
+        print(f"Error in joinvc: {e}")
+        await ctx.send(f"❌ Error starting transcription session: {str(e)}")
+
+async def save_transcript(ctx, session_id):
+    session = active_sessions.get(session_id)
+    if not session or not session.transcripts:
+        await ctx.send("No transcripts to save!")
+        return
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"transcripts/transcript_{timestamp}.txt"
+    
+    # Ensure transcripts directory exists
+    os.makedirs('transcripts', exist_ok=True)
+
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(f"Transcript from Discord Voice Channel: {session.channel_name}\n")
+        f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("-" * 50 + "\n\n")
+        
+        for transcript in session.transcripts:
+            user = await bot.fetch_user(int(transcript['user_id']))
+            username = user.name if user else transcript['user_id']
+            f.write(f"[{transcript['timestamp']}] {username}: {transcript['text']}\n")
+
+    await ctx.send("📝 Here's your transcript:", file=discord.File(filename))
+
+@bot.command(name='leavevc')
+async def leavevc(ctx):
+    session_id = f"{ctx.guild.id}_{ctx.author.voice.channel.id}"
+    
+    if session_id in active_sessions:
+        active_sessions[session_id].is_active = False
+        await save_transcript(ctx, session_id)
+        del active_sessions[session_id]
+        await ctx.send("👋 Stopped tracking transcriptions. Transcript has been saved!")
+    else:
+        await ctx.send("❌ No active transcription session.")
+
 @bot.command(name='status')
 async def status(ctx):
-    """Check if the bot is recording in the current channel"""
-    if ctx.voice_client:
-        session_id = str(ctx.guild.id) + "_" + str(ctx.voice_client.channel.id)
-        if session_id in transcripts:
-            transcript_count = len(transcripts[session_id])
-            await ctx.send(f"✅ Currently recording in {ctx.voice_client.channel.name}. {transcript_count} transcripts captured.")
-        else:
-            await ctx.send("❌ Connected but not recording.")
-    else:
-        await ctx.send("❌ Not connected to any voice channel.")
+    if not ctx.author.voice:
+        return await ctx.send("❌ You're not in a voice channel.")
+
+    session_id = f"{ctx.guild.id}_{ctx.author.voice.channel.id}"
+    session = active_sessions.get(session_id)
+    
+    if not session:
+        return await ctx.send("❌ No active recording session.")
+
+    duration = (datetime.now() - session.start_time).seconds
+    transcript_count = len(session.transcripts)
+    
+    await ctx.send(
+        f"✅ Currently tracking transcriptions in {session.channel_name}\n"
+        f"📝 {transcript_count} transcripts captured\n"
+        f"⏱️ Session duration: {duration} seconds"
+    )
 
 @bot.command(name='savenow')
 async def savenow(ctx):
-    """Save the current transcript without leaving the channel"""
-    if ctx.voice_client:
-        session_id = str(ctx.guild.id) + "_" + str(ctx.voice_client.channel.id)
-        if session_id in transcripts:
-            await save_transcript(ctx, session_id)
-            # Clear the transcripts but keep recording
-            transcripts[session_id] = []
-            await ctx.send("💾 Transcript saved! Continuing to record...")
-        else:
-            await ctx.send("❌ No transcripts to save.")
-    else:
-        await ctx.send("❌ Not connected to any voice channel.")
+    if not ctx.author.voice:
+        return await ctx.send("❌ You're not in a voice channel.")
+
+    session_id = f"{ctx.guild.id}_{ctx.author.voice.channel.id}"
+    
+    if session_id not in active_sessions:
+        return await ctx.send("❌ No active transcription session.")
+
+    try:
+        await save_transcript(ctx, session_id)
+        active_sessions[session_id].transcripts = []  # Clear transcripts but keep session active
+        await ctx.send("💾 Transcript saved! Continuing to track transcriptions...")
+    except Exception as e:
+        await ctx.send(f"❌ Error saving transcript: {str(e)}")
 
 @bot.command(name='help')
 async def help(ctx):
-    """Show available commands"""
-    commands = """
+    help_text = """
 🎤 **Voice Transcription Bot Commands**
-`!joinvc` - Join your voice channel and start recording
-`!leavevc` - Leave voice channel and save transcript
-`!status` - Check if bot is recording
+`!joinvc` - Start tracking transcriptions in your voice channel
+`!leavevc` - Stop tracking and save transcript
+`!status` - Check tracking status
 `!savenow` - Save current transcript without stopping
 `!help` - Show this help message
     """
-    await ctx.send(commands)
+    await ctx.send(help_text)
 
-# Join VC Command
-@bot.command(name='joinvc')
-async def joinvc(ctx):
-    if ctx.author.voice:
-        channel = ctx.author.voice.channel
-        try:
-            vc = await channel.connect()
-            # Initialize empty transcript for this session
-            session_id = str(ctx.guild.id) + "_" + str(channel.id)
-            transcripts[session_id] = []
-            
-            await ctx.send(f"✅ Joined {channel}! Recording and transcribing...")
-            asyncio.create_task(handle_audio(vc, ctx, session_id))
-        except Exception as e:
-            await ctx.send(f"❌ Error joining voice channel: {str(e)}")
-    else:
-        await ctx.send("❌ You need to be in a voice channel first.")
+# Error handling
+@bot.event
+async def on_error(event, *args, **kwargs):
+    print(f"Error in {event}:", args[0])
 
-# Leave VC Command
-@bot.command(name='leavevc')
-async def leavevc(ctx):
-    if ctx.voice_client:
-        session_id = str(ctx.guild.id) + "_" + str(ctx.voice_client.channel.id)
-        
-        # Save transcript before disconnecting
-        if session_id in transcripts:
-            await save_transcript(ctx, session_id)
-            del transcripts[session_id]
-        
-        await ctx.voice_client.disconnect()
-        await ctx.send("👋 Left the voice channel. Transcript has been saved!")
-    else:
-        await ctx.send("❌ I'm not connected to a voice channel.")
-
-async def save_transcript(ctx, session_id):
-    if not transcripts[session_id]:
-        await ctx.send("No transcripts to save!")
-        return
-        
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"transcript_{timestamp}.txt"
+# Add new routes for status and save commands
+@app.route('/transcription/status', methods=['POST'])
+def check_status():
+    data = request.json
+    print(f"🔍 DEBUG: Received status request: {data}")
     
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(f"Transcript from Discord Voice Channel: {ctx.voice_client.channel.name}\n")
-        f.write(f"Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write("-" * 50 + "\n\n")
-        for transcript in transcripts[session_id]:
-            f.write(f"{transcript}\n")
+    guild_id = data.get('guild_id')
+    channel_id = data.get('channel_id')
+    session_id = f"{guild_id}_{channel_id}"
     
-    # Send the transcript file to Discord
-    await ctx.send("📝 Here's your transcript:", file=discord.File(filename))
+    if session_id in active_sessions:
+        session = active_sessions[session_id]
+        return {
+            'status': 'active',
+            'transcript_count': len(session.transcripts),
+            'duration': (datetime.now() - session.start_time).seconds
+        }
+    return {'status': 'inactive'}, 404
 
-async def handle_audio(vc, ctx, session_id):
-    # Connect to Deepgram WebSocket
-    dg_client = Deepgram(DEEPGRAM_API_KEY)
+@app.route('/transcription/save', methods=['POST'])
+def save_now():
+    data = request.json
+    print(f"🔍 DEBUG: Received save request: {data}")
     
-    try:
-        deepgram_socket = await dg_client.transcription.live({
-            'punctuate': True,
-            'interim_results': False,
-            'language': 'en-US',
-            'model': 'general',
-            'encoding': 'linear16',
-            'sample_rate': 48000
-        })
+    guild_id = data.get('guild_id')
+    channel_id = data.get('channel_id')
+    session_id = f"{guild_id}_{channel_id}"
+    
+    if session_id in active_sessions:
+        # Call save_transcript here
+        # You'll need to modify save_transcript to work with the Flask context
+        return {'status': 'saved'}
+    return {'status': 'no_session'}, 404
 
-        # Listen for Deepgram responses
-        @deepgram_socket.event
-        async def on_transcript(transcript):
-            transcript_text = transcript['channel']['alternatives'][0].get('transcript', '')
-            if transcript_text.strip():
-                # Store the transcript
-                transcripts[session_id].append(transcript_text)
-                # Print to console for debugging
-                print(f"🎤 Transcribed: {transcript_text}")
-        
-        # Start recording
-        vc.start_recording(
-            discord.sinks.WaveSink(),
-            once_done,
-            ctx
-        )
-        
-        # Keep the connection alive while recording
-        while vc.is_connected():
-            await asyncio.sleep(1)
-            
-    except Exception as e:
-        print(f"Error in handle_audio: {str(e)}")
-        await ctx.send(f"❌ Error during transcription: {str(e)}")
-    finally:
-        if vc.is_connected():
-            vc.stop_recording()
-            await deepgram_socket.finish()
+def run_flask():
+    app.run(port=5000)
 
-async def once_done(sink: discord.sinks.WaveSink, ctx: commands.Context):
-    # Convert the recorded audio to the format Deepgram expects
-    for user_id, audio in sink.audio_data.items():
-        # Send audio data to Deepgram
-        if audio.file:
-            try:
-                with wave.open(audio.file, 'rb') as wave_file:
-                    audio_data = wave_file.readframes(wave_file.getnframes())
-                    await deepgram_socket.send(audio_data)
-            except Exception as e:
-                print(f"Error processing audio: {str(e)}")
+def run_discord_bot():
+    bot.run(DISCORD_TOKEN)
 
-# Start bot
-bot.run(DISCORD_TOKEN)
+if __name__ == "__main__":
+    # Start Flask in a separate thread
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.start()
+    
+    # Run Discord bot in main thread
+    run_discord_bot()
